@@ -558,3 +558,111 @@ class TestDryRun:
         assert default is False or default == False, (  # noqa: E712
             f"main(apply) default is {default!r}; must be False (dry-run by default)"
         )
+
+
+# ---------------------------------------------------------------------------
+# T12 – --no-sms / sms=False: apply without texting citizens
+# ---------------------------------------------------------------------------
+
+class TestNoSms:
+    """
+    main(apply=True, sms=False) must write the UPDATE to the DB but send
+    zero SMS messages.  This is needed for backfill runs where ~4,800 citizens
+    would otherwise receive unexpected texts.
+
+    main(apply=True) (no sms kwarg) must default to sms=True – existing
+    behaviour is unchanged.
+
+    CLI: deemed_approval.py --apply --no-sms must be accepted without error
+    and must suppress SMS.
+
+    RED: these tests fail until sms=False / --no-sms is implemented.
+    """
+
+    _SUB    = datetime(2026, 3, 1, 10, 0, 0)
+    _DOB_60 = date(1966, 3, 1)   # age 60 on 2026-03-01 – eligible
+
+    @pytest.fixture()
+    def tmp_cfg(self, tmp_path):
+        cfg = configparser.ConfigParser()
+        cfg["database"] = {"host": "127.0.0.1", "port": "5432",
+                           "name": "x", "user": "x", "password": "x"}
+        cfg["app"]      = {"sms_gateway_url": "http://localhost:1"}
+        cfg["pension"]  = {"sla_days": "15", "min_age": "60"}
+        p = tmp_path / "test.ini"
+        p.write_text("\n".join(
+            f"[{s}]\n" + "\n".join(f"{k}={v}" for k, v in cfg[s].items())
+            for s in cfg.sections()
+        ))
+        return str(p)
+
+    def _run(self, rows, tmp_cfg, apply: bool, sms: bool, caplog):
+        """Call main(apply=apply, sms=sms) with mocked DB; return (update_calls, sms_calls)."""
+        mod = _scheduler()
+
+        fake_cur  = mock.MagicMock()
+        fake_cur.fetchall.return_value = rows
+        fake_conn = mock.MagicMock()
+        fake_conn.cursor.return_value = fake_cur
+
+        with mock.patch("psycopg2.connect", return_value=fake_conn), \
+             mock.patch("requests.post") as mock_post, \
+             mock.patch.dict(os.environ, {"SEWASETU_CONFIG": tmp_cfg}), \
+             caplog.at_level(logging.INFO):
+            mod.main(apply=apply, sms=sms)
+
+        update_calls = [
+            c for c in fake_cur.execute.call_args_list
+            if c.args and "UPDATE" in str(c.args[0]).upper()
+        ]
+        return update_calls, mock_post.call_args_list
+
+    def test_main_accepts_sms_kwarg(self):
+        """main() must accept a 'sms' keyword argument."""
+        import inspect
+        mod = _scheduler()
+        sig = inspect.signature(mod.main)
+        assert "sms" in sig.parameters, \
+            "main() has no 'sms' parameter; --no-sms not implemented"
+
+    def test_sms_defaults_to_true(self):
+        """main(sms=...) default must be True so existing callers are unaffected."""
+        import inspect
+        mod = _scheduler()
+        sig = inspect.signature(mod.main)
+        params = sig.parameters
+        assert "sms" in params, "main() has no 'sms' parameter"
+        default = params["sms"].default
+        assert default is True or default == True, (  # noqa: E712
+            f"main(sms) default is {default!r}; expected True (SMS enabled by default)"
+        )
+
+    def test_no_sms_suppresses_requests_post(self, tmp_cfg, caplog):
+        """With sms=False, requests.post must never be called even for eligible rows."""
+        rows = [("SSP002", "9000000002", self._DOB_60, self._SUB)]
+        updates, sms_calls = self._run(rows, tmp_cfg, apply=True, sms=False, caplog=caplog)
+        assert updates, "apply=True,sms=False still did not execute UPDATE"
+        assert not sms_calls, (
+            f"sms=False still called requests.post {len(sms_calls)} time(s)"
+        )
+
+    def test_sms_true_still_calls_requests_post(self, tmp_cfg, caplog):
+        """With sms=True (default), requests.post is called for each eligible row."""
+        rows = [("SSP002", "9000000002", self._DOB_60, self._SUB)]
+        updates, sms_calls = self._run(rows, tmp_cfg, apply=True, sms=True, caplog=caplog)
+        assert updates, "apply=True,sms=True did not execute UPDATE"
+        assert sms_calls, (
+            "sms=True did not call requests.post; SMS must be sent by default"
+        )
+
+    def test_cli_accepts_no_sms_flag(self, tmp_cfg):
+        """--no-sms CLI flag must be recognised (argparse must not error on it)."""
+        import inspect
+        mod = _scheduler()
+        # Verify the argparse parser in __main__ block would accept --no-sms.
+        # We check by inspecting that the script source contains the flag definition.
+        src = SCRIPT_PATH.read_text(encoding="utf-8")
+        assert "--no-sms" in src, (
+            "deemed_approval.py does not define --no-sms argument; "
+            "add parser.add_argument('--no-sms', ...) in the __main__ block"
+        )
