@@ -22,12 +22,23 @@ Fix-1 changes
   listed separately for DC review.
 * SMS failures are logged at ERROR; never silently swallowed.
 * Any unhandled exception → rollback → sys.exit(1) so cron log shows failure.
+
+Fix-2 changes
+-------------
+* Dry-run by default: main(apply=False) is the safe default.  The job prints
+  what it WOULD do (counts, eligible IDs, excluded IDs) but executes no UPDATE
+  and no commit.  To write to the DB, pass --apply on the command line or call
+  main(apply=True) in code.
+* decided_at: set to submitted_at + sla_days (the statutory deadline date),
+  NOT to the time the job runs.  The legal deemed-approval date is the day the
+  SLA expired, not the day the cron job happened to notice it.  The nightly job
+  uses the same formula; only the value of submitted_at differs per row.
 """
 
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import requests
@@ -118,11 +129,29 @@ def find_overdue(cur, now: datetime, sla_days: int = 15):
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> int:
+def main(apply: bool = False) -> int:
+    """
+    Run the deemed-approval job.
+
+    Parameters
+    ----------
+    apply : bool
+        False (default) → dry-run: query the DB, log what WOULD be done,
+        execute no UPDATE, make no commit, send no SMS.
+        True            → apply mode: execute the UPDATE, commit, send SMS.
+
+    CLI equivalents
+    ---------------
+        python deemed_approval.py            # dry-run (safe)
+        python deemed_approval.py --apply    # writes to the DB
+    """
     logging.basicConfig(
         format="%(asctime)s %(levelname)s deemed_approval: %(message)s",
         level=logging.INFO,
     )
+
+    mode = "APPLY" if apply else "DRY-RUN"
+    logging.info("deemed_approval: starting in %s mode", mode)
 
     cfg      = load_config()
     sla_days = cfg.getint("pension", "sla_days")
@@ -144,11 +173,11 @@ def main() -> int:
         rows = find_overdue(cur, now, sla_days)
 
         # 2. Split into eligible (age >= 60 at submission in IST) and skipped.
-        eligible = []
+        eligible = []   # list of (app_no, mobile, submitted_at)
         skipped  = []
         for app_no, mobile, dob, submitted_at in rows:
             if is_eligible_at_submission(dob, submitted_at, min_age):
-                eligible.append((app_no, mobile))
+                eligible.append((app_no, mobile, submitted_at))
             else:
                 logging.warning(
                     "deemed_approval: SKIPPING %s mobile=%s – age at submission < %d "
@@ -163,21 +192,52 @@ def main() -> int:
                 len(skipped), min_age, skipped,
             )
 
-        # 3. Update only eligible rows.  Parameterised SQL; IN %s with tuple.
+        logging.info(
+            "deemed_approval: [%s] %d eligible, %d excluded (under-%d)",
+            mode, len(eligible), len(skipped), min_age,
+        )
         if eligible:
-            cutoff_naive = compute_cutoff(now, sla_days).replace(tzinfo=None)
+            logging.info(
+                "deemed_approval: [%s] eligible ids: %s",
+                mode, [r[0] for r in eligible],
+            )
+
+        if not apply:
+            # ---------------------------------------------------------------
+            # DRY-RUN: report only, no writes
+            # ---------------------------------------------------------------
+            logging.info(
+                "deemed_approval: [DRY-RUN] would approve %d application(s). "
+                "Re-run with --apply to write.",
+                len(eligible),
+            )
+            return 0
+
+        # 3. APPLY MODE: Update only eligible rows.
+        #    decided_at = submitted_at + sla_days days (the statutory expiry
+        #    date – the legal deemed-approval date is when the SLA expired,
+        #    not when the cron job ran).  Parameterised SQL; IN %s with tuple.
+        if eligible:
             app_nos      = tuple(r[0] for r in eligible)
+            cutoff_naive = compute_cutoff(now, sla_days).replace(tzinfo=None)
             cur.execute(
                 """
                 UPDATE applications
                 SET    status      = %s,
-                       decided_at  = %s,
+                       decided_at  = submitted_at + %s,
                        decided_by  = %s
                 WHERE  status           = %s
                 AND    application_no IN %s
                 AND    submitted_at    <= %s
                 """,
-                ("DEEMED_APPROVED", now, "RTPS-AUTO", "PENDING", app_nos, cutoff_naive),
+                (
+                    "DEEMED_APPROVED",
+                    timedelta(days=sla_days),   # row-level: each row's own deadline
+                    "RTPS-AUTO",
+                    "PENDING",
+                    app_nos,
+                    cutoff_naive,
+                ),
             )
             conn.commit()
             logging.info(
@@ -189,7 +249,7 @@ def main() -> int:
             logging.info("deemed_approval: no eligible overdue applications to process")
 
         # 4. Send SMS (best-effort; errors already logged inside send_approval_sms).
-        for app_no, mobile in eligible:
+        for app_no, mobile, _ in eligible:
             send_approval_sms(mobile, app_no, sms_url)
 
     except Exception:
@@ -208,4 +268,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="RTPS deemed-approval job.  Default is dry-run (safe)."
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help="Write approved status to the DB and send SMS. Without this flag the "
+             "job reports what it would do without making any changes.",
+    )
+    args = parser.parse_args()
+    sys.exit(main(apply=args.apply))

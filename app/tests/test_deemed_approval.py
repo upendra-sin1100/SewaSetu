@@ -311,7 +311,7 @@ class TestSchedulerBehaviour:
         return str(p)
 
     def _run_main(self, rows, tmp_cfg, caplog):
-        """Run main() with mocked psycopg2 returning `rows`; capture UPDATE calls."""
+        """Run main(apply=True) with mocked psycopg2 returning `rows`; capture UPDATE calls."""
         mod = _scheduler()
 
         fake_cur  = mock.MagicMock()
@@ -323,7 +323,7 @@ class TestSchedulerBehaviour:
              mock.patch("requests.post"), \
              mock.patch.dict(os.environ, {"SEWASETU_CONFIG": tmp_cfg}), \
              caplog.at_level(logging.WARNING):
-            mod.main()
+            mod.main(apply=True)  # apply=True: these tests verify write behaviour
 
         update_calls = [
             c for c in fake_cur.execute.call_args_list
