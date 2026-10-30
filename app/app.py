@@ -12,8 +12,23 @@ import io
 import csv
 import random
 import hashlib
+import importlib.util
 import configparser
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
+
+# ---------------------------------------------------------------------------
+# Import is_overdue from the scheduler so the status page and the nightly
+# job share identical boundary logic.  We use importlib so the scripts/
+# directory does not need to be on sys.path and the __main__ block is never
+# executed by this import.
+# ---------------------------------------------------------------------------
+_DA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "scripts", "deemed_approval.py")
+_da_spec = importlib.util.spec_from_file_location("deemed_approval", _DA_PATH)
+_da_mod  = importlib.util.module_from_spec(_da_spec)
+_da_spec.loader.exec_module(_da_mod)
+is_overdue = _da_mod.is_overdue
+IST        = _da_mod.IST
 
 import requests
 import psycopg2
@@ -339,10 +354,18 @@ def handle_submission():
 
 
 def generate_acknowledgment(cur, app_id):
-    cur.execute("SELECT application_no, applicant_name, mobile, dob, village, block, "
-                "bank_account, ifsc, submitted_at, status FROM applications WHERE id = %s",
-                (app_id,))
+    cur.execute(
+        "SELECT application_no, applicant_name, mobile, dob, village, block, "
+        "bank_account, ifsc, submitted_at, status FROM applications WHERE id = %s",
+        (app_id,),
+    )
     row = cur.fetchone()
+    # Apply the same RTPS deemed-approval display logic as the status page.
+    # Row layout: [0..7 fields], submitted_at[8], status[9]
+    display_status = row[9]
+    if row[9] == "PENDING" and is_overdue(row[8], datetime.now(tz=IST), SLA_DAYS):
+        display_status = "DEEMED_APPROVED"
+    display_row = row[:9] + (display_status,)
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 14)
@@ -359,7 +382,7 @@ def generate_acknowledgment(cur, app_id):
     labels = ["Application No", "Applicant Name", "Mobile", "Date of Birth",
               "Village", "Block", "Bank Account", "IFSC", "Submitted At", "Status"]
     pdf.set_font("Helvetica", "", 10)
-    for label, val in zip(labels, row):
+    for label, val in zip(labels, display_row):
         try:
             pdf.cell(60, 8, label, border=1)
             pdf.cell(0, 8, str(val), border=1, ln=1)
@@ -410,14 +433,25 @@ def view_application(app_id):
         return redirect(url_for("status_login"))
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT application_no, applicant_name, mobile, dob, village, block, "
-                "bank_account, ifsc, status, submitted_at, decided_at "
-                "FROM applications WHERE id = %s", (app_id,))
+    cur.execute(
+        "SELECT application_no, applicant_name, mobile, dob, village, block, "
+        "bank_account, ifsc, status, submitted_at, decided_at "
+        "FROM applications WHERE id = %s",
+        (app_id,),
+    )
     row = cur.fetchone()
     cur.close(); conn.close()
     if not row:
         abort(404)
-    return render_template("application.html", a=row, app_id=app_id)
+    # If the file is still PENDING but the SLA has elapsed, show it as
+    # DEEMED_APPROVED to the citizen (RTPS Act obligation).  The DB row is
+    # NOT updated here; the nightly scheduler does that.
+    display_status = row[8]
+    if row[8] == "PENDING" and is_overdue(row[9], datetime.now(tz=IST), SLA_DAYS):
+        display_status = "DEEMED_APPROVED"
+    # Rebuild the row tuple with the corrected display status
+    display_row = row[:8] + (display_status,) + row[9:]
+    return render_template("application.html", a=display_row, app_id=app_id)
 
 
 @app.route("/ack/<int:app_id>.pdf")

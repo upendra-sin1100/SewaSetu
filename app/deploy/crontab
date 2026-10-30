@@ -1,3 +1,4 @@
 # Sewa Setu scheduled jobs
+TZ=Asia/Kolkata
 PATH=/usr/local/bin:/usr/bin:/bin
-0 2 * * * python /app/scripts/deemed_approval.py >> /var/log/sewasetu/cron.log 2>&1
+0 2 * * * python /app/scripts/deemed_approval.py >> /var/log/sewasetu/cron.log 2>&1 || echo "deemed_approval FAILED exit=$?" >> /var/log/sewasetu/cron.log

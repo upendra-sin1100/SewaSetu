@@ -238,6 +238,7 @@ class TestStatusPageRendering:
 
     @pytest.fixture()
     def client(self):
+        pytest.importorskip("fpdf", reason="fpdf2 not installed; run inside Docker where deps are available")
         spec = importlib.util.spec_from_file_location("sewasetu_app", APP_PY_PATH)
         mod  = importlib.util.module_from_spec(spec)
         # Patch psycopg2.connect before module-level code runs
