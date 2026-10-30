@@ -12,29 +12,20 @@ import io
 import csv
 import random
 import hashlib
-import importlib.util
 import configparser
 from datetime import datetime, date, timedelta, timezone
 
-# ---------------------------------------------------------------------------
-# Import is_overdue from the scheduler so the status page and the nightly
-# job share identical boundary logic.  We use importlib so the scripts/
-# directory does not need to be on sys.path and the __main__ block is never
-# executed by this import.
-# ---------------------------------------------------------------------------
-_DA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "scripts", "deemed_approval.py")
-_da_spec = importlib.util.spec_from_file_location("deemed_approval", _DA_PATH)
-_da_mod  = importlib.util.module_from_spec(_da_spec)
-_da_spec.loader.exec_module(_da_mod)
-is_overdue = _da_mod.is_overdue
-IST        = _da_mod.IST
+# Shared business rules (pure Python, no Flask/DB dependency).
+# In Docker: WORKDIR=/app so `from rules import` resolves to /app/rules.py.
+# In tests: conftest.py at the repo root adds app/ to sys.path first.
+from rules import is_overdue, IST  # noqa: E402
 
 import requests
 import psycopg2
 from flask import (Flask, request, session, redirect, url_for, render_template,
                    flash, send_file, abort, jsonify)
 from fpdf import FPDF
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 

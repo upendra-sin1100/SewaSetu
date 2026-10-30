@@ -2,101 +2,70 @@
 """
 Nightly deemed-approval job.
 
-Under the Purvanchal Right to Public Services Act, an application not processed
-within the statutory SLA stands approved. This job marks such applications
-DEEMED_APPROVED and notifies the applicant by SMS.
+Under the Purvanchal Right to Public Services Act, an application not
+processed within the statutory SLA stands DEEMED_APPROVED.  This job marks
+such applications and notifies the applicant by SMS.
 
 Scheduled via cron (TZ=Asia/Kolkata), 02:00 IST daily. See deploy/crontab.
 
-Refactored for Fix 1:
-  - All logic in named functions; no top-level side-effects beyond config load.
-  - Config reads app/config/app.ini (single source of truth; env SEWASETU_CONFIG
-    overrides the path for testing).
-  - compute_cutoff() and is_overdue() are importable by app.py so the status
-    page and the scheduler share identical boundary logic.
-  - IST-aware cutoff: fixed offset +05:30, no ZoneInfo dependency.
-  - submitted_at is TIMESTAMP WITHOUT TZ in the DB (psycopg2 returns naive);
-    is_overdue() normalises it by treating it as IST-wall-clock time.
-  - SMS failures are logged at ERROR level; they are never silently swallowed.
-  - Script exits non-zero on any unhandled exception (sys.exit(1)).
+Fix-1 changes
+-------------
+* Config: reads app/config/app.ini (SEWASETU_CONFIG env var overrides path).
+* Shared logic: imports is_overdue, compute_cutoff, is_eligible_at_submission,
+  IST from app/rules.py.  No importlib hackery.
+* submitted_at column type is TIMESTAMP WITHOUT TIME ZONE (naive from psycopg2).
+  is_overdue() and is_eligible_at_submission() both treat naive values as IST
+  wall-clock via .replace(tzinfo=IST) – not .astimezone().
+  find_overdue() compares naive-IST to naive-IST in the DB query (strip tz
+  from the cutoff before binding) to avoid server-timezone mismatch.
+* Under-60 at submission (IST date) are excluded, logged at WARNING, and
+  listed separately for DC review.
+* SMS failures are logged at ERROR; never silently swallowed.
+* Any unhandled exception → rollback → sys.exit(1) so cron log shows failure.
 """
 
 import logging
 import os
 import sys
-import configparser
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import psycopg2
 import requests
 
 # ---------------------------------------------------------------------------
-# IST constant – fixed offset, no ZoneInfo/pytz dependency
+# Shared rules – imported from app/rules.py.
+# sys.path is extended so this works when run as a script from any CWD
+# (the Dockerfile WORKDIR is /app so `from rules import` works natively;
+# the path manipulation is only needed when invoked as a standalone script
+# from outside /app, e.g. during local development or tests).
 # ---------------------------------------------------------------------------
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+from rules import IST, compute_cutoff, is_overdue, is_eligible_at_submission  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Allow tests to override the config path via env var (never touches live DB).
-CONFIG_PATH = os.environ.get(
-    "SEWASETU_CONFIG",
-    os.path.join(BASE_DIR, "config", "app.ini"),
-)
+DEFAULT_CONFIG_PATH = os.path.join(_APP_DIR, "config", "app.ini")
 
 
-def load_config() -> configparser.ConfigParser:
+def load_config():
+    import configparser
+    path = os.environ.get("SEWASETU_CONFIG", DEFAULT_CONFIG_PATH)
     cfg = configparser.ConfigParser()
-    with open(CONFIG_PATH) as fh:
+    with open(path) as fh:
         cfg.read_file(fh)
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Core logic – importable by app.py for the status page
-# ---------------------------------------------------------------------------
-
-def compute_cutoff(now: datetime, sla_days: int) -> datetime:
-    """
-    Return the latest submitted_at that is still within the SLA, as an
-    IST-aware datetime.
-
-    ``now`` must be IST-aware (caller's responsibility).  The returned
-    cutoff carries the same +05:30 tzinfo so comparisons are unambiguous.
-    """
-    return now - timedelta(days=sla_days)
-
-
-def is_overdue(submitted_at: datetime, now: datetime, sla_days: int = 15) -> bool:
-    """
-    Return True when an application has breached the RTPS SLA.
-
-    ``submitted_at`` may be naive (as returned by psycopg2 from a TIMESTAMP
-    WITHOUT TIME ZONE column).  We treat it as IST wall-clock time – because
-    the application window closes at midnight IST and all timestamps in the DB
-    were written by the Flask app running in IST context.
-
-    ``now`` must be IST-aware.
-
-    Boundary: exactly at the SLA edge is overdue (closed interval <=).
-    """
-    if submitted_at.tzinfo is None:
-        # Naive → attach IST; do NOT convert (the stored wall-clock time IS IST)
-        submitted_at = submitted_at.replace(tzinfo=IST)
-    cutoff = compute_cutoff(now, sla_days)
-    return submitted_at <= cutoff
-
-
-# ---------------------------------------------------------------------------
-# SMS helper – logs failures, never swallows them silently
+# SMS – logs failures at ERROR, never swallows them
 # ---------------------------------------------------------------------------
 
 def send_approval_sms(mobile: str, app_no: str, sms_gateway_url: str) -> None:
-    """Send an RTPS deemed-approval notification.  Any exception is logged at ERROR."""
     try:
         requests.post(
             sms_gateway_url + "/api/send",
@@ -111,41 +80,42 @@ def send_approval_sms(mobile: str, app_no: str, sms_gateway_url: str) -> None:
         )
     except Exception as exc:
         logging.error(
-            "deemed_approval: SMS failed for application %s mobile %s: %s",
+            "deemed_approval: SMS failed for %s mobile %s: %s",
             app_no, mobile, exc,
         )
 
 
 # ---------------------------------------------------------------------------
-# Database query – parameterised SQL only
+# DB query – parameterised SQL only; naive cutoff for naive column
 # ---------------------------------------------------------------------------
 
 def find_overdue(cur, now: datetime, sla_days: int = 15):
     """
-    Return list of (application_no, mobile) for PENDING rows that have
-    breached the SLA.
+    Return list of (application_no, mobile, dob, submitted_at) for PENDING
+    rows that have breached the SLA.
 
-    Uses parameterised SQL; the cutoff is computed in Python so the IST
-    timezone handling is explicit and testable.
+    submitted_at is TIMESTAMP WITHOUT TIME ZONE → stored as IST wall-clock,
+    returned as a naive datetime by psycopg2.  We compare naive-IST to
+    naive-IST in the DB query (strip tz from the cutoff) so that the
+    comparison is apples-to-apples and is not affected by the Postgres
+    server's local timezone setting.
     """
-    cutoff = compute_cutoff(now, sla_days)
-    # Convert to UTC for the DB comparison so the TIMESTAMP column arithmetic
-    # is unambiguous (psycopg2 sends an aware datetime → Postgres converts correctly).
-    cutoff_utc = cutoff.astimezone(timezone.utc)
+    cutoff       = compute_cutoff(now, sla_days)
+    cutoff_naive = cutoff.replace(tzinfo=None)   # strip tz: compare wall-clock to wall-clock
     cur.execute(
         """
-        SELECT application_no, mobile
+        SELECT application_no, mobile, dob, submitted_at
         FROM   applications
         WHERE  status       = %s
         AND    submitted_at <= %s
         """,
-        ("PENDING", cutoff_utc),
+        ("PENDING", cutoff_naive),
     )
     return cur.fetchall()
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> int:
@@ -156,6 +126,7 @@ def main() -> int:
 
     cfg      = load_config()
     sla_days = cfg.getint("pension", "sla_days")
+    min_age  = cfg.getint("pension", "min_age")
     sms_url  = cfg.get("app", "sms_gateway_url")
 
     conn = psycopg2.connect(
@@ -168,42 +139,69 @@ def main() -> int:
     try:
         cur = conn.cursor()
         now = datetime.now(tz=IST)
+
+        # 1. Find all overdue PENDING rows.
         rows = find_overdue(cur, now, sla_days)
 
-        cur.execute(
-            """
-            UPDATE applications
-            SET    status      = %s,
-                   decided_at  = %s,
-                   decided_by  = %s
-            WHERE  status      = %s
-            AND    submitted_at <= %s
-            """,
-            (
-                "DEEMED_APPROVED",
-                now,                          # decided_at = run time
-                "RTPS-AUTO",
-                "PENDING",
-                compute_cutoff(now, sla_days).astimezone(timezone.utc),
-            ),
-        )
-        conn.commit()
+        # 2. Split into eligible (age >= 60 at submission in IST) and skipped.
+        eligible = []
+        skipped  = []
+        for app_no, mobile, dob, submitted_at in rows:
+            if is_eligible_at_submission(dob, submitted_at, min_age):
+                eligible.append((app_no, mobile))
+            else:
+                logging.warning(
+                    "deemed_approval: SKIPPING %s mobile=%s – age at submission < %d "
+                    "(dob=%s submitted_at=%s IST); forwarded to DC for review",
+                    app_no, mobile, min_age, dob, submitted_at,
+                )
+                skipped.append(app_no)
 
-        logging.info(
-            "%s deemed_approval: %d application(s) approved",
-            now.strftime("%Y-%m-%d %H:%M:%S %Z"),
-            len(rows),
-        )
+        if skipped:
+            logging.info(
+                "deemed_approval: %d application(s) skipped (under-%d at submission): %s",
+                len(skipped), min_age, skipped,
+            )
 
-        for app_no, mobile in rows:
+        # 3. Update only eligible rows.  Parameterised SQL; IN %s with tuple.
+        if eligible:
+            cutoff_naive = compute_cutoff(now, sla_days).replace(tzinfo=None)
+            app_nos      = tuple(r[0] for r in eligible)
+            cur.execute(
+                """
+                UPDATE applications
+                SET    status      = %s,
+                       decided_at  = %s,
+                       decided_by  = %s
+                WHERE  status           = %s
+                AND    application_no IN %s
+                AND    submitted_at    <= %s
+                """,
+                ("DEEMED_APPROVED", now, "RTPS-AUTO", "PENDING", app_nos, cutoff_naive),
+            )
+            conn.commit()
+            logging.info(
+                "deemed_approval: %s – %d application(s) approved",
+                now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                len(eligible),
+            )
+        else:
+            logging.info("deemed_approval: no eligible overdue applications to process")
+
+        # 4. Send SMS (best-effort; errors already logged inside send_approval_sms).
+        for app_no, mobile in eligible:
             send_approval_sms(mobile, app_no, sms_url)
 
     except Exception:
         conn.rollback()
-        logging.exception("deemed_approval: unhandled error; rolled back")
-        raise
+        logging.exception("deemed_approval: unhandled error; transaction rolled back")
+        raise   # causes sys.exit(1) via the outer wrapper
+
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
         conn.close()
 
     return 0

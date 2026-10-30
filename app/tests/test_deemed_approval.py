@@ -190,6 +190,9 @@ class TestStatusPageRendering:
             spec.loader.exec_module(mod)
 
         flask_app = mod.app
+        # The Flask app's template_folder is relative to its root_path (APP_DIR).
+        # When imported via importlib from outside app/, Jinja needs the absolute path.
+        flask_app.template_folder = str(APP_DIR / "templates")
         flask_app.config.update(TESTING=True, SECRET_KEY="test-secret")
 
         fake_cur  = mock.MagicMock()
@@ -203,6 +206,7 @@ class TestStatusPageRendering:
                     sess["logged_in"]     = True
                     sess["portal_mobile"] = "9000000001"
                 yield c
+
 
     def test_overdue_not_shown_as_pending(self, client):
         resp = client.get("/application/1")
