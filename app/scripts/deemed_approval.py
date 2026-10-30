@@ -33,6 +33,14 @@ Fix-2 changes
   NOT to the time the job runs.  The legal deemed-approval date is the day the
   SLA expired, not the day the cron job happened to notice it.  The nightly job
   uses the same formula; only the value of submitted_at differs per row.
+
+Fix-3 changes
+-------------
+* sms=True parameter on main(): callers can pass sms=False to suppress all
+  SMS notifications.  This is essential for the initial backfill (~4,800
+  citizens) to avoid unexpected texts for decisions that were legally due
+  months ago.  The nightly cron job always runs with sms=True (the default)
+  so live approvals are still notified.  CLI: --no-sms flag.
 """
 
 import logging
@@ -129,7 +137,7 @@ def find_overdue(cur, now: datetime, sla_days: int = 15):
 # Main
 # ---------------------------------------------------------------------------
 
-def main(apply: bool = False) -> int:
+def main(apply: bool = False, sms: bool = True) -> int:
     """
     Run the deemed-approval job.
 
@@ -138,12 +146,19 @@ def main(apply: bool = False) -> int:
     apply : bool
         False (default) → dry-run: query the DB, log what WOULD be done,
         execute no UPDATE, make no commit, send no SMS.
-        True            → apply mode: execute the UPDATE, commit, send SMS.
+        True            → apply mode: execute the UPDATE, commit, send SMS
+        (subject to the ``sms`` parameter).
+    sms : bool
+        True (default)  → send SMS notifications to approved citizens.
+        False           → suppress all SMS (use for backfill runs to avoid
+        texting ~4,800 citizens for decisions that were legally due months
+        ago).  Only meaningful when apply=True; dry-run never sends SMS.
 
     CLI equivalents
     ---------------
-        python deemed_approval.py            # dry-run (safe)
-        python deemed_approval.py --apply    # writes to the DB
+        python deemed_approval.py                  # dry-run (safe)
+        python deemed_approval.py --apply          # writes + sends SMS
+        python deemed_approval.py --apply --no-sms # writes, suppresses SMS
     """
     logging.basicConfig(
         format="%(asctime)s %(levelname)s deemed_approval: %(message)s",
@@ -249,8 +264,15 @@ def main(apply: bool = False) -> int:
             logging.info("deemed_approval: no eligible overdue applications to process")
 
         # 4. Send SMS (best-effort; errors already logged inside send_approval_sms).
-        for app_no, mobile, _ in eligible:
-            send_approval_sms(mobile, app_no, sms_url)
+        #    Skipped entirely when sms=False (e.g. backfill runs).
+        if sms:
+            for app_no, mobile, _ in eligible:
+                send_approval_sms(mobile, app_no, sms_url)
+        else:
+            logging.info(
+                "deemed_approval: SMS suppressed (--no-sms); %d citizen(s) not notified.",
+                len(eligible),
+            )
 
     except Exception:
         conn.rollback()
@@ -279,5 +301,13 @@ if __name__ == "__main__":
         help="Write approved status to the DB and send SMS. Without this flag the "
              "job reports what it would do without making any changes.",
     )
+    parser.add_argument(
+        "--no-sms",
+        action="store_true",
+        default=False,
+        dest="no_sms",
+        help="Suppress SMS notifications. Use with --apply during backfill runs "
+             "to avoid texting citizens for decisions that are months overdue.",
+    )
     args = parser.parse_args()
-    sys.exit(main(apply=args.apply))
+    sys.exit(main(apply=args.apply, sms=not args.no_sms))
