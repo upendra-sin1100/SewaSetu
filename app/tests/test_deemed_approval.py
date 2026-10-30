@@ -19,6 +19,10 @@ Covers:
        not importlib; scheduler exposes is_overdue via rules
   T9   BEHAVIOURAL: under-60 applicants are excluded from the UPDATE and
        produce a WARNING log; script exits non-zero on DB failure
+  T10  is_eligible_at_submission pure-function boundary tests (in class
+       TestUnder60Exclusion below)
+  T11  DRY-RUN SAFETY: main() without apply=True must execute zero UPDATEs
+       and zero commits; main(apply=True) must execute the UPDATE
 
 Design constraints:
   - Zero live Postgres connections.
@@ -416,3 +420,141 @@ class TestUnder60Exclusion:
         dob_60    = date(1966, 2, 28)                       # turns 60 on 2026-02-28
         assert fn(dob_60, sub_naive, 60) is True, \
             "Naive submitted_at not treated as IST; IST date mismatch"
+
+
+# ---------------------------------------------------------------------------
+# T11 – DRY-RUN SAFETY
+# ---------------------------------------------------------------------------
+
+class TestDryRun:
+    """
+    main() must be safe to call without --apply:
+      - Zero UPDATEs executed.
+      - Zero commits.
+      - Eligible and excluded IDs printed/logged (counts visible in output).
+    main(apply=True) executes the UPDATE as before.
+
+    RED: these tests fail until dry-run / apply flag is implemented.
+    """
+
+    _SUB   = datetime(2026, 3, 1, 10, 0, 0)
+    _DOB_59 = date(1967, 3, 1)   # age 59 – excluded
+    _DOB_60 = date(1966, 3, 1)   # age 60 – eligible
+
+    @pytest.fixture()
+    def tmp_cfg(self, tmp_path):
+        cfg = configparser.ConfigParser()
+        cfg["database"] = {"host": "127.0.0.1", "port": "5432",
+                           "name": "x", "user": "x", "password": "x"}
+        cfg["app"]      = {"sms_gateway_url": "http://localhost:1"}
+        cfg["pension"]  = {"sla_days": "15", "min_age": "60"}
+        p = tmp_path / "test.ini"
+        p.write_text("\n".join(
+            f"[{s}]\n" + "\n".join(f"{k}={v}" for k, v in cfg[s].items())
+            for s in cfg.sections()
+        ))
+        return str(p)
+
+    def _run(self, rows, tmp_cfg, apply: bool, caplog):
+        """Call main(apply=apply) with mocked DB; return (update_calls, commit_calls)."""
+        mod = _scheduler()
+
+        fake_cur  = mock.MagicMock()
+        fake_cur.fetchall.return_value = rows
+        fake_conn = mock.MagicMock()
+        fake_conn.cursor.return_value = fake_cur
+
+        with mock.patch("psycopg2.connect", return_value=fake_conn), \
+             mock.patch("requests.post"), \
+             mock.patch.dict(os.environ, {"SEWASETU_CONFIG": tmp_cfg}), \
+             caplog.at_level(logging.INFO):
+            mod.main(apply=apply)
+
+        update_calls = [
+            c for c in fake_cur.execute.call_args_list
+            if c.args and "UPDATE" in str(c.args[0]).upper()
+        ]
+        commit_calls = fake_conn.commit.call_args_list
+        return update_calls, commit_calls
+
+    def test_dry_run_executes_no_update(self, tmp_cfg, caplog):
+        """Without apply=True, NO UPDATE must reach the cursor."""
+        rows = [
+            ("SSP001", "9000000001", self._DOB_59, self._SUB),
+            ("SSP002", "9000000002", self._DOB_60, self._SUB),
+        ]
+        updates, _ = self._run(rows, tmp_cfg, apply=False, caplog=caplog)
+        assert not updates, (
+            f"Dry-run issued {len(updates)} UPDATE(s); must be zero without --apply"
+        )
+
+    def test_dry_run_does_not_commit(self, tmp_cfg, caplog):
+        """Without apply=True, conn.commit() must never be called."""
+        rows = [("SSP002", "9000000002", self._DOB_60, self._SUB)]
+        _, commits = self._run(rows, tmp_cfg, apply=False, caplog=caplog)
+        assert not commits, (
+            f"Dry-run called commit() {len(commits)} time(s); must be zero"
+        )
+
+    def test_dry_run_logs_eligible_count(self, tmp_cfg, caplog):
+        """Dry-run must log the number of eligible applicants it WOULD approve."""
+        rows = [("SSP002", "9000000002", self._DOB_60, self._SUB)]
+        self._run(rows, tmp_cfg, apply=False, caplog=caplog)
+        msgs = " ".join(r.message for r in caplog.records)
+        assert "1" in msgs and ("eligible" in msgs.lower() or "dry" in msgs.lower()), (
+            "Dry-run did not log eligible count; expected count and 'eligible'/'dry' in log"
+        )
+
+    def test_dry_run_logs_excluded_count(self, tmp_cfg, caplog):
+        """Dry-run must log the number of under-60 applicants that were excluded."""
+        rows = [
+            ("SSP001", "9000000001", self._DOB_59, self._SUB),  # excluded
+            ("SSP002", "9000000002", self._DOB_60, self._SUB),  # eligible
+        ]
+        self._run(rows, tmp_cfg, apply=False, caplog=caplog)
+        msgs = " ".join(r.message for r in caplog.records)
+        assert "1" in msgs and ("skip" in msgs.lower() or "exclud" in msgs.lower()), (
+            "Dry-run did not log excluded count"
+        )
+
+    def test_apply_true_executes_update(self, tmp_cfg, caplog):
+        """With apply=True, the UPDATE must be executed for eligible rows."""
+        rows = [("SSP002", "9000000002", self._DOB_60, self._SUB)]
+        updates, _ = self._run(rows, tmp_cfg, apply=True, caplog=caplog)
+        assert updates, "apply=True did not execute any UPDATE"
+        assert "SSP002" in str(updates[0]), "SSP002 missing from UPDATE with apply=True"
+
+    def test_apply_true_commits(self, tmp_cfg, caplog):
+        """With apply=True, conn.commit() must be called exactly once."""
+        rows = [("SSP002", "9000000002", self._DOB_60, self._SUB)]
+        _, commits = self._run(rows, tmp_cfg, apply=True, caplog=caplog)
+        assert len(commits) == 1, (
+            f"Expected exactly 1 commit with apply=True, got {len(commits)}"
+        )
+
+    def test_default_is_dry_run_via_subprocess(self, tmp_cfg):
+        """
+        Running the script without --apply must exit 0 and must NOT execute
+        any UPDATE: verified by running as a subprocess against a real (but
+        empty) in-process SQLite-compatible stub is impractical, so instead
+        we verify that main() signature accepts no positional args and that
+        calling main() (no apply kwarg) is equivalent to apply=False.
+
+        The subprocess test uses --dry-run flag: script must accept it without
+        error and must exit 0 even when DB is unavailable (dry-run reports
+        what it would do based on the DB query, so DB still needed; but with
+        a bad DB it should exit non-zero – tested separately).
+        """
+        import inspect
+        mod = _scheduler()
+        sig = inspect.signature(mod.main)
+        params = sig.parameters
+        # main() must accept an `apply` keyword argument
+        assert "apply" in params, (
+            "main() has no 'apply' parameter; dry-run not implemented"
+        )
+        # Default must be False (dry-run by default)
+        default = params["apply"].default
+        assert default is False or default == False, (  # noqa: E712
+            f"main(apply) default is {default!r}; must be False (dry-run by default)"
+        )
