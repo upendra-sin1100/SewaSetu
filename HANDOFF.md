@@ -40,7 +40,53 @@ Date: 2026-10-30
 
 ## Current phase
 
-Phase 3 audit is complete. Phase 4 has not started. No application or citizen data has been changed.
+Phase 4 is in progress. Fixes 1–3 are complete and committed. Fix 4 (DB connection
+exhaustion / month-end outage) has not started.  Scheduler container is STOPPED.
+No citizen records have been altered since the previous handoff agent's live-DB write
+(4,798 rows changed to DEEMED_APPROVED; see AI_LOG.md for disclosure).
+
+### Completed commits (this session)
+
+| Commit | Description | Tests |
+|---|---|---|
+| `1e53839` | test(cron): crontab must use --apply | red |
+| `76ecb29` | fix(cron): add --apply to crontab; .gitattributes LF | green (40) |
+| `274a7bb` | test(fix3-no-sms): T12 red – main() must accept sms=False | red (5 fail) |
+| `2badce6` | fix(fix3-no-sms): sms=True param, --no-sms CLI flag | green (45) |
+| `bc82f3b` | test(fix2+3-security): red – IDOR on /application /ack admin; SQLi | red (6 fail) |
+| `189a8b8` | fix(fix2+3-security): IDOR checks, SQLi param, secrets from env vars | green (55) |
+
+### Fix 1 – RTPS deemed-approval (complete)
+
+- Config: reads `app/config/app.ini` (was `settings.ini` — missing file)
+- IST cutoff, under-60 skip, status page display, SMS failure logging
+- `--apply` flag (default dry-run); `--no-sms` flag for backfill
+- Nightly crontab now passes `--apply`; LF line endings enforced via `.gitattributes`
+
+### Fix 2 – Citizen IDOR (complete)
+
+Three separate IDOR vectors fixed in `app.py`:
+
+1. **`/application/<id>`** — now checks `row[2] (mobile) == session["portal_mobile"]`; returns 403 if mismatch.  Admin sessions (`session["admin"]`) are redirected to the admin route instead.
+2. **`/ack/<id>.pdf`** — previously had zero auth. Now requires `logged_in`; citizens may only fetch their own PDF (mobile match); admins may fetch any.
+3. **`/admin/approve/<id>` and `/admin/reject/<id>`** — previously checked `logged_in` (any citizen session); now require `session["admin"]`.
+
+### Fix 3 – SQL injection (complete)
+
+`reset_password` had two injectable queries using `% mobile` string interpolation.
+Both replaced with parameterised `cur.execute(sql, (mobile,))`.
+
+Tests use a cursor spy that records `(sql, params)` and asserts the injection payload
+`x' OR '1'='1` appears in `params`, not in `sql`.
+
+### Secrets rotation (complete)
+
+- `SEWASETU_SECRET_KEY` and `SEWASETU_ADMIN_PASSWORD` read from env vars; app raises
+  `RuntimeError` at startup if either is unset (fail-loud, no in-repo defaults).
+- Values are in `.env.production` (gitignored).
+- `docker-compose.yml` references `env_file: .env.production` for `app` and `scheduler`.
+- New admin password: see `.env.production` (hand over to auditor directly).
+
 
 ## Phase 1-3 findings
 
