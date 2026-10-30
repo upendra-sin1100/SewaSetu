@@ -48,8 +48,13 @@ APP_PY     = APP_DIR / "app.py"
 def _load_app() -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("sewasetu_app", APP_PY)
     mod  = importlib.util.module_from_spec(spec)
+    env_patch = {
+        "SEWASETU_SECRET_KEY": "test-secret-key",
+        "SEWASETU_ADMIN_PASSWORD": "test-admin-password",
+    }
     with mock.patch("psycopg2.connect",
-                    side_effect=RuntimeError("no live DB in tests")):
+                    side_effect=RuntimeError("no live DB in tests")), \
+         mock.patch.dict(os.environ, env_patch):
         spec.loader.exec_module(mod)
     flask_app = mod.app
     flask_app.template_folder = str(APP_DIR / "templates")
@@ -214,34 +219,142 @@ class TestIDOR:
 # ---------------------------------------------------------------------------
 
 class TestSQLInjection:
-    """Password reset must use parameterised SQL; no string interpolation in SQL."""
+    """
+    Password-reset must use parameterised SQL.
 
-    def test_reset_password_sql_is_parameterised(self):
+    The original vulnerable code (lines 471-474 of vendor app.py):
+
+        cur.execute("SELECT mobile FROM portal_users WHERE mobile = '%s'" % mobile)
+        cur.execute("SELECT dob FROM applications WHERE mobile = '%s' LIMIT 1" % mobile)
+
+    With these queries, the payload   x' OR '1'='1   is *interpolated into the
+    SQL string* before psycopg2 ever sees it, so psycopg2 executes:
+        WHERE mobile = 'x' OR '1'='1'
+    which matches every row.
+
+    The fix requires:
+        cur.execute("... WHERE mobile = %s", (mobile,))
+
+    With parameterised queries, psycopg2 receives the *unmodified* payload as a
+    bind parameter; the SQL string itself only ever contains %s.
+
+    The tests below use a cursor spy that records every (sql, params) pair so we
+    can make precise, behavioural assertions – not fragile source-code regex.
+    """
+
+    PAYLOAD = "x' OR '1'='1"
+
+    @pytest.fixture()
+    def spy_cursor(self):
         """
-        T-SQLI-2: The reset_password view must not build SQL with % string format.
-        We inspect the source for the known injection pattern.
+        A MagicMock cursor that records every execute() call as (sql, params)
+        and returns None from fetchone() by default (no rows – clean DB state).
         """
-        src = APP_PY.read_text(encoding="utf-8")
+        calls = []
+
+        cur = mock.MagicMock()
+        cur._spy_calls = calls
+
+        def record_execute(sql, params=None):
+            calls.append((sql, params))
+
+        cur.execute.side_effect = record_execute
+        cur.fetchone.return_value = None   # no matching mobile → no reset
+        return cur
+
+    @pytest.fixture()
+    def reset_client(self, mod, spy_cursor):
+        """Flask test client wired to the spy cursor, for reset_password tests."""
+        flask_app = mod.app
+        fake_conn = mock.MagicMock()
+        fake_conn.cursor.return_value = spy_cursor
+        with mock.patch.object(mod, "get_db", return_value=fake_conn), \
+             mock.patch.object(mod, "send_sms"):
+            with flask_app.test_client() as c:
+                yield c, spy_cursor, fake_conn
+
+    def _post_reset(self, client, payload):
+        return client.post("/status/reset", data={"mobile": payload})
+
+    # ------------------------------------------------------------------
+    # T-SQLI-1  Payload must land in bind params, not in the SQL string
+    # ------------------------------------------------------------------
+
+    def test_payload_is_in_params_not_sql(self, reset_client):
+        """
+        T-SQLI-1: After POSTing the injection payload, every cursor.execute()
+        call must have the payload in its *params* tuple, not embedded in the
+        SQL string itself.
+
+        With the vulnerable code, string interpolation runs at the Python level
+        before psycopg2 is called, so the first execute() gets:
+            sql = "SELECT mobile FROM portal_users WHERE mobile = 'x' OR '1'='1'"
+            params = None
+        — payload IS in sql, NOT in params.  This test catches that.
+
+        After the fix, execute() gets:
+            sql = "SELECT mobile FROM portal_users WHERE mobile = %s"
+            params = ("x' OR '1'='1",)
+        — payload is ONLY in params, never in sql.
+        """
+        client, spy_cursor, _ = reset_client
+        self._post_reset(client, self.PAYLOAD)
+
+        select_calls = [
+            (sql, params)
+            for sql, params in spy_cursor._spy_calls
+            if "portal_users" in sql or "applications" in sql
+        ]
+        assert select_calls, (
+            "reset_password did not call cursor.execute() with any SELECT; "
+            "check the view is reachable in the test."
+        )
+        for sql, params in select_calls:
+            assert self.PAYLOAD not in sql, (
+                f"Injection payload found INSIDE the SQL string:\n  sql={sql!r}\n"
+                "This means string interpolation is happening before psycopg2 — "
+                "the query is injectable. Fix: use parameterised queries."
+            )
+            # Payload must be in the params tuple (proves it's a bind parameter)
+            assert params is not None and self.PAYLOAD in params, (
+                f"Injection payload NOT found in params:\n  sql={sql!r}\n  params={params!r}\n"
+                "Fix: cur.execute(sql, (mobile,)) — mobile must be a bind parameter."
+            )
+
+    # ------------------------------------------------------------------
+    # T-SQLI-2  No single-quoted %s placeholder in any SQL in app.py
+    # ------------------------------------------------------------------
+
+    def test_no_single_quoted_placeholder_in_sql(self):
+        """
+        T-SQLI-2: Source-code sanity check.  The vendor pattern
+            WHERE mobile = '%s'" % mobile
+        wraps the placeholder in SQL quotes, making it injectable.
+        Correct psycopg2 syntax never quotes %s in the SQL string.
+        """
         import re
-        # Match: .execute( ... "..." % something )  on one line (the vendor pattern)
-        bad_pattern = re.compile(
-            r'\.execute\s*\([^)]*%\s*\w',
-            re.MULTILINE,
-        )
-        matches = bad_pattern.findall(src)
+        src = APP_PY.read_text(encoding="utf-8")
+        # Matches the literal string  = '%s'  anywhere in the source.
+        # Legitimate parameterised code never has this pattern.
+        matches = re.findall(r"= '%s'", src)
         assert not matches, (
-            f"SQL string interpolation found in app.py: {matches}. "
-            "Use parameterised queries: cur.execute(sql, (param,))"
+            f"Found {len(matches)} instance(s) of  = '%s'  in app.py. "
+            "This is the vendor SQLi pattern. "
+            "Replace with the unquoted placeholder  = %s  and pass the value "
+            "as a bind parameter: cur.execute(sql, (value,))."
         )
+
+    # ------------------------------------------------------------------
+    # T-SQLI-3  No f-string SQL in app.py
+    # ------------------------------------------------------------------
 
     def test_no_fstring_sql(self):
         """
         T-SQLI-3: No f-string or %-interpolated SQL anywhere in app.py.
         Checks for f"...{...}..." patterns touching SQL keywords.
         """
-        src = APP_PY.read_text(encoding="utf-8")
         import re
-        # f-strings containing SQL keywords
+        src = APP_PY.read_text(encoding="utf-8")
         fstring_sql = re.compile(
             r'f["\'].*?(SELECT|INSERT|UPDATE|DELETE|WHERE).*?\{',
             re.IGNORECASE,
@@ -251,41 +364,21 @@ class TestSQLInjection:
             f"f-string SQL detected in app.py: {matches}"
         )
 
-    def test_reset_injection_payload_does_not_trigger_sms(self, mod):
+    # ------------------------------------------------------------------
+    # T-SQLI-4  No DB commit when payload doesn't match any real mobile
+    # ------------------------------------------------------------------
+
+    def test_no_commit_on_injection_payload(self, reset_client):
         """
-        T-SQLI-1: POST /status/reset with injection payload must not trigger send_sms.
-
-        With the vulnerable code:
-          cur.execute("SELECT mobile FROM portal_users WHERE mobile = '%s'" % mobile)
-        the payload x' OR '1'='1 produces:
-          WHERE mobile = 'x' OR '1'='1'
-        which matches every row, so the reset fires.
-
-        We simulate this by having the mock cursor return None for fetchone()
-        (correct parameterised behaviour: the literal string does not match).
-        After the fix, send_sms must NOT be called.
+        T-SQLI-4: With a parameterised query, fetchone() returns None for
+        the injection payload (no real mobile matches the literal string).
+        Therefore no password reset should commit anything to the DB.
         """
-        flask_app = mod.app
-        fake_cur  = mock.MagicMock()
-        fake_conn = mock.MagicMock()
-        fake_conn.cursor.return_value = fake_cur
-        # Parameterised query: injection payload won't match any real mobile -> None
-        fake_cur.fetchone.return_value = None
-
-        with mock.patch.object(mod, "get_db", return_value=fake_conn), \
-             mock.patch.object(mod, "send_sms") as mock_sms, \
-             mock.patch("requests.post"):
-            with flask_app.test_client() as c:
-                c.post("/status/reset", data={"mobile": "x' OR '1'='1"})
-
-        # If SQLi works and the mock is bypassed (raw string interpolation runs
-        # at the Python level before psycopg2 sees it), the exploit path is still
-        # caught because we check send_sms was NOT called.
-        assert not mock_sms.called, (
-            "SQL injection in reset_password triggered send_sms – "
-            "the WHERE clause matched despite the injection payload. "
-            "Fix: use parameterised queries (cur.execute(sql, (mobile,)))."
-        )
+        client, _, fake_conn = reset_client
+        self._post_reset(client, self.PAYLOAD)
         assert not fake_conn.commit.called, (
-            "SQL injection in reset_password triggered a DB commit."
+            "DB commit was called despite the injection payload returning no rows. "
+            "This suggests the parameterisation is incomplete or fetchone() "
+            "returned a row when it shouldn't have."
         )
+

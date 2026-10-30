@@ -187,10 +187,13 @@ class TestStatusPageRendering:
     def client(self):
         # app.py now does `from rules import is_overdue, IST` – no importlib.
         # We patch psycopg2.connect so no DB is opened during module init.
+        # Also patch required env vars (post Fix-3 secrets change).
         spec = importlib.util.spec_from_file_location("sewasetu_app", APP_PY_PATH)
         mod  = importlib.util.module_from_spec(spec)
+        _env = {"SEWASETU_SECRET_KEY": "test-secret", "SEWASETU_ADMIN_PASSWORD": "test-pw"}
         with mock.patch("psycopg2.connect",
-                        side_effect=RuntimeError("no live DB in tests")):
+                        side_effect=RuntimeError("no live DB in tests")), \
+             mock.patch.dict(os.environ, _env):
             spec.loader.exec_module(mod)
 
         flask_app = mod.app

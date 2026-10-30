@@ -33,11 +33,26 @@ config = configparser.ConfigParser()
 config.read(os.path.join(BASE_DIR, "config", "app.ini"))
 
 app = Flask(__name__)
-app.secret_key = config.get("app", "secret_key")
+# Secret key and admin password come from environment variables.
+# No in-repo defaults – missing vars raise KeyError at startup so a
+# misconfigured deployment fails loudly instead of running with known secrets.
+_secret_key   = os.environ.get("SEWASETU_SECRET_KEY")
+_admin_pw     = os.environ.get("SEWASETU_ADMIN_PASSWORD")
+if not _secret_key:
+    raise RuntimeError(
+        "SEWASETU_SECRET_KEY env var is not set. "
+        "Set it in your .env.production (never commit the value)."
+    )
+if not _admin_pw:
+    raise RuntimeError(
+        "SEWASETU_ADMIN_PASSWORD env var is not set. "
+        "Set it in your .env.production (never commit the value)."
+    )
+app.secret_key = _secret_key
 app.config["PERMANENT_SESSION_LIFETIME"] = 300
 
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "sewasetu@123"
+ADMIN_PASSWORD = _admin_pw
 
 SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
@@ -419,7 +434,8 @@ def status_login():
 
 @app.route("/application/<int:app_id>")
 def view_application(app_id):
-    if not session.get("logged_in"):
+    if not session.get("logged_in") or session.get("admin"):
+        # Admin uses /admin/application/<id>; citizens must be logged in via status portal.
         flash("Please login to view application status.")
         return redirect(url_for("status_login"))
     conn = get_db()
@@ -434,6 +450,9 @@ def view_application(app_id):
     cur.close(); conn.close()
     if not row:
         abort(404)
+    # Fix 2 – IDOR: a citizen may only view their own application.
+    if row[2] != session.get("portal_mobile"):
+        abort(403)
     # If the file is still PENDING but the SLA has elapsed, show it as
     # DEEMED_APPROVED to the citizen (RTPS Act obligation).  The DB row is
     # NOT updated here; the nightly scheduler does that.
@@ -447,31 +466,47 @@ def view_application(app_id):
 
 @app.route("/ack/<int:app_id>.pdf")
 def ack_pdf(app_id):
+    # Fix 2 – IDOR: require citizen login and ownership check.
+    if not session.get("logged_in"):
+        flash("Please login to view your acknowledgement PDF.")
+        return redirect(url_for("status_login"))
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT mobile FROM applications WHERE id = %s",
+        (app_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.close(); conn.close()
+        abort(404)
+    # Admins may view any PDF; citizens may only view their own.
+    if not session.get("admin") and row[0] != session.get("portal_mobile"):
+        cur.close(); conn.close()
+        abort(403)
     path = os.path.join(UPLOAD_DIR, "ack", "%d.pdf" % app_id)
     if not os.path.exists(path):
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM applications WHERE id = %s", (app_id,))
-        if not cur.fetchone():
-            cur.close(); conn.close()
-            abort(404)
         data = generate_acknowledgment(cur, app_id)
         cur.close(); conn.close()
         return send_file(io.BytesIO(data), mimetype="application/pdf")
+    cur.close(); conn.close()
     return send_file(path, mimetype="application/pdf")
 
 
 @app.route("/status/reset", methods=["GET", "POST"])
 def reset_password():
     if request.method == "POST":
-        mobile = request.form.get("mobile", "")
+        mobile = request.form.get("mobile", "").strip()
         conn = get_db()
         cur = conn.cursor()
-        # fetch account for reset
-        cur.execute("SELECT mobile FROM portal_users WHERE mobile = '%s'" % mobile)
+        # Fix 3 – SQLi: parameterised queries only; no string interpolation.
+        cur.execute("SELECT mobile FROM portal_users WHERE mobile = %s", (mobile,))
         row = cur.fetchone()
         if row:
-            cur.execute("SELECT dob FROM applications WHERE mobile = '%s' LIMIT 1" % mobile)
+            cur.execute(
+                "SELECT dob FROM applications WHERE mobile = %s ORDER BY id LIMIT 1",
+                (mobile,),
+            )
             r2 = cur.fetchone()
             if r2:
                 newpass = r2[0].strftime("%d%m%Y")
@@ -556,7 +591,8 @@ def admin_view(app_id):
 
 @app.route("/admin/approve/<int:app_id>", methods=["POST"])
 def admin_approve(app_id):
-    if not session.get("logged_in"):
+    # Fix 2 – IDOR: require admin flag, not just any logged-in session.
+    if not session.get("admin"):
         abort(403)
     conn = get_db()
     cur = conn.cursor()
@@ -570,7 +606,8 @@ def admin_approve(app_id):
 
 @app.route("/admin/reject/<int:app_id>", methods=["POST"])
 def admin_reject(app_id):
-    if not session.get("logged_in"):
+    # Fix 2 – IDOR: require admin flag, not just any logged-in session.
+    if not session.get("admin"):
         abort(403)
     conn = get_db()
     cur = conn.cursor()

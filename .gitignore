@@ -4,3 +4,5 @@ __pycache__/
 *.dump
 *.sql.gz
 under60_dc_review.txt
+.env.production
+admin_credentials*.txt
