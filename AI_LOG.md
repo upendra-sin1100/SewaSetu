@@ -29,3 +29,14 @@
 - **One-time token design broke re-download (Fix 4b).** The original Fix 4 used `session.pop("just_submitted_id")` so the token was consumed on the first request. This caused the second request — which Chrome's PDF viewer always makes when the user clicks the in-viewer download button — to receive a 302 redirect to the login page, leaving an Unconfirmed `.crdownload` file on disk. The correct design is to read the token with `session.get()` (not pop) and validate it against `app_id` without destroying it. The token is still scoped to one application id; it simply survives multiple browser fetches of the same URL. This error arose because the design was modelled on a web-form submission token (where one-time use is the goal) rather than on a file-serve URL that a browser may fetch multiple times in quick succession.
 
 - **Phase 3 audit missed that the PDF used a built-in latin-only font (Fix 6).** The audit noted "300 non-ASCII names; byte-based sanitizer; Helvetica PDF" and ranked it #7 but did not trace the exact failure mode: `generate_acknowledgment()` called `pdf.set_font("Helvetica")`, which is fpdf2's built-in CP1252/latin-1 font. When any character with codepoint > 127 was passed to `pdf.cell()`, the bare `except Exception: pdf.cell(0, 8, "?")` branch silently replaced the entire value with a literal "?". Additionally, `sanitize()` sliced on bytes (`value.encode("utf-8")[:20]`), which cut 3-byte Bengali codepoints mid-sequence and then discarded the truncated bytes via `errors="ignore"`, producing a shorter but apparently-ASCII string — masking the damage in text logs while the real corruption appeared only in the rendered PDF. Both bugs had to be fixed together: character-based `sanitize()` (limit 100, matching `VARCHAR(100)`) plus an embedded Unicode TTF (Noto Sans Bengali) loaded via `pdf.add_font()`.
+
+## 2026-10-30 (Fix 4b/6 session)
+
+- Reported the red commit as done when `&&` failed on PowerShell; verified only later from git log.
+- Claimed OFL.txt was written; git showed it was missing. Added in 8ce9ea8.
+- Used the Bengali font for all PDF text, so Latin labels lost their glyphs. The tests did not catch it; the glyph warning did.
+- Forgot to register the bold style for NotoSansBengali, which crashed the PDF.
+- The `?`-counting assertion was fragile (it counted unrelated bytes); replaced with a /FontFile2 check.
+- Empty-name test only checked sanitize("") == "", weaker than the requirement. The form still says "Something went wrong" (not fixed).
+- Called test_exit_nonzero_on_db_failure a pre-existing failure without evidence; it passed in the final run.
+- set_text_shaping was dropped (it broke Latin glyphs), so Bengali conjuncts such as in the name ?????? may not join.
