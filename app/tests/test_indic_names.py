@@ -149,24 +149,16 @@ class TestAckPdfFont:
         fake_cur = self._make_fake_cur(SHORT_ASSAMESE)
         pdf_bytes = mod.generate_acknowledgment(fake_cur, 1)
 
-        # The bare '?' substitution shows up as the ASCII byte 0x3F in the
-        # PDF content stream.  A proper Unicode PDF will contain the name in
-        # either UTF-16BE (for ToUnicode CMap) or the TTF-encoded glyph stream.
-        # We check that the PDF does not contain the pattern we know the broken
-        # code produces: the literal 7-bit string b"?" surrounded by PDF text
-        # operators.  The simplest reliable proxy: after decoding printable ASCII
-        # from the PDF, the string "?" appears fewer times than the number of
-        # non-ASCII characters in the name (the broken Helvetica path produces
-        # exactly len(non-ascii-chars) "?" substitutions).
-        non_ascii_count = sum(1 for ch in SHORT_ASSAMESE if ord(ch) > 127)
-        printable_ascii = pdf_bytes.decode("latin-1", errors="replace")
-        q_count = printable_ascii.count("?")
-        assert q_count < non_ascii_count, (
-            f"T-NAME-4a: PDF contains {q_count} '?' characters for a name with "
-            f"{non_ascii_count} non-ASCII characters. "
-            "The Helvetica latin-1 font is substituting '?' for every Bengali glyph. "
-            "Fix: embed a Unicode TTF (e.g. Noto Sans Bengali) via pdf.add_font()."
+        # /FontFile2 is the PDF stream key for an embedded TrueType font.
+        # Its presence proves add_font() loaded the TTF into the document.
+        # Counting raw '?' bytes in a compressed PDF stream is unreliable
+        # because zlib-compressed data contains arbitrary byte values.
+        assert b"/FontFile2" in pdf_bytes, (
+            "T-NAME-4a: PDF does not contain an embedded TrueType font (/FontFile2). "
+            "The Helvetica latin-1 built-in font is being used instead of the "
+            "Noto Sans Bengali TTF. Fix: call pdf.add_font() with the TTF path."
         )
+
 
     def test_pdf_references_ttf_not_helvetica_for_bengali(self, mod):
         """T-NAME-4b: The PDF must not use Helvetica as the sole font for name cell."""

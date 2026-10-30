@@ -422,6 +422,14 @@ def handle_submission():
     return render_template("confirmation.html", app_no=app_no, app_id=new_id)
 
 
+def _font_for(pdf, text, bold=False, size=11):
+    """Use Helvetica for ASCII text, NotoSansBengali for non-ASCII (Bengali/Assamese)."""
+    if str(text).isascii():
+        pdf.set_font("Helvetica", "B" if bold else "", size)
+    else:
+        pdf.set_font("NotoSansBengali", "B" if bold else "", size)
+
+
 def generate_acknowledgment(cur, app_id):
     cur.execute(
         "SELECT application_no, applicant_name, mobile, dob, village, block, "
@@ -438,50 +446,24 @@ def generate_acknowledgment(cur, app_id):
     pdf = FPDF()
     pdf.add_page()
 
-    # Fix 6 – embed Noto Sans Bengali so Assamese/Bengali names render correctly.
-    # The built-in Helvetica font is latin-1 only; any codepoint > 127 was
-    # silently replaced with '?' by the bare except branch below.
-    # We load the TTF once; if the file is somehow missing, fall back to
-    # Helvetica (PDF will still be generated, names may show '?').
-    noto_ok = False
+    # Fix 6 – embed Noto Sans Bengali so non-ASCII names (Assamese, Bengali)
+    # render without '?' substitution.  _font_for() picks Helvetica for any
+    # pure-ASCII string and NotoSansBengali for strings containing non-ASCII
+    # characters, so labels/numbers/dates stay in Helvetica (which has full
+    # Latin coverage) while Bengali names transparently switch to the TTF.
     if os.path.exists(NOTO_BENGALI_FONT):
         try:
             pdf.add_font(family="NotoSansBengali", fname=NOTO_BENGALI_FONT)
-            # Register the same Regular TTF for the Bold style slot so that
-            # set_font("NotoSansBengali", style="B") resolves.  We only have
-            # one weight; the title is visually distinguished by size alone.
             pdf.add_font(family="NotoSansBengali", style="B",
                          fname=NOTO_BENGALI_FONT)
-            # Try enabling HarfBuzz text shaping (needs uharfbuzz installed).
-            # If uharfbuzz is absent or set_text_shaping() does not exist on
-            # this fpdf2 build, we skip shaping – the font still embeds
-            # correctly and Latin + common Bengali glyphs will render.
-            try:
-                pdf.set_text_shaping(use_shaping_engine=True)
-            except Exception:
-                pass  # shaping unavailable – font still embedded
-            noto_ok = True
         except Exception:
-            pass  # font file corrupt or add_font failed
+            pass  # font absent or corrupt – _font_for falls back to Helvetica
 
-
-    def _set_title_font(bold=False):
-        style = "B" if bold else ""
-        if noto_ok:
-            pdf.set_font("NotoSansBengali", style=style, size=14 if bold else 11)
-        else:
-            pdf.set_font("Helvetica", style=style, size=14 if bold else 11)
-
-    def _set_body_font(size=10):
-        if noto_ok:
-            pdf.set_font("NotoSansBengali", size=size)
-        else:
-            pdf.set_font("Helvetica", size=size)
-
-    _set_title_font(bold=True)
+    _font_for(pdf, "GOVERNMENT OF PURVANCHAL", bold=True, size=14)
     pdf.cell(0, 10, "GOVERNMENT OF PURVANCHAL", new_x="LMARGIN", new_y="NEXT", align="C")
-    _set_title_font(bold=False)
+    _font_for(pdf, "Department of Social Welfare", size=11)
     pdf.cell(0, 8, "Department of Social Welfare", new_x="LMARGIN", new_y="NEXT", align="C")
+    _font_for(pdf, "Old Age Pension Scheme - Acknowledgment", size=11)
     pdf.cell(0, 8, "Old Age Pension Scheme - Acknowledgment", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(4)
     # decorative border, as per approved letterhead design
@@ -491,18 +473,20 @@ def generate_acknowledgment(cur, app_id):
         pdf.line(x, 12, x + 0.5, 12)
     labels = ["Application No", "Applicant Name", "Mobile", "Date of Birth",
               "Village", "Block", "Bank Account", "IFSC", "Submitted At", "Status"]
-    _set_body_font(size=10)
     for label, val in zip(labels, display_row):
+        _font_for(pdf, label, size=10)
         pdf.cell(60, 8, label, border=1)
+        _font_for(pdf, val, size=10)
         pdf.cell(0, 8, str(val), border=1, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
-    if noto_ok:
-        pdf.set_font("NotoSansBengali", size=9)
-    else:
-        pdf.set_font("Helvetica", style="I", size=9)
-    pdf.multi_cell(0, 5, "This is a computer generated acknowledgment. Processing SLA "
-                         "as per the Purvanchal Right to Public Services Act applies.")
+    footer = ("This is a computer generated acknowledgment. Processing SLA "
+              "as per the Purvanchal Right to Public Services Act applies.")
+    _font_for(pdf, footer, size=9)
+    pdf.multi_cell(0, 5, footer)
     return bytes(pdf.output())
+
+
+
 
 
 # ---------------------------------------------------------------------------
