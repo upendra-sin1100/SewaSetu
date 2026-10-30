@@ -69,6 +69,11 @@ BLOCKS = ["Sonari", "Rajapara", "Dhemaji Pathar", "Borgaon", "Namti", "Khelua"]
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg"}
 
+# Fix 6 – Indic font for PDF generation.
+# NotoSansBengali-Regular.ttf is committed under app/static/fonts/ with OFL.txt.
+NOTO_BENGALI_FONT = os.path.join(BASE_DIR, "static", "fonts",
+                                 "NotoSansBengali-Regular.ttf")
+
 # Safety net: if Flask's own MAX_CONTENT_LENGTH ever gets set, make sure it is
 # at least as large as our limit so we don't double-gate below our own cap.
 app.config.setdefault("MAX_CONTENT_LENGTH", MAX_UPLOAD_BYTES + 1024)
@@ -103,14 +108,27 @@ def get_db():
     )
 
 
-def sanitize(value, maxlen=20):
-    # Trim input to safe length for downstream systems (NIC mandate 2019:
-    # legacy disbursement interface accepts fixed-width fields).
+def sanitize(value, maxlen=100):
+    """Trim name to at most maxlen *characters* (not bytes).
+
+    The DB column is VARCHAR(100) in PostgreSQL UTF-8 – that means 100
+    characters, not 100 bytes.  The previous 20-byte slice silently
+    truncated multi-byte scripts (Bengali, Assamese) mid-character.
+
+    maxlen defaults to 100 to match the DB column.  If the stripped
+    value exceeds maxlen characters, we raise ValueError with a
+    human-readable message so the route can flash it to the citizen
+    rather than silently mangling the name.
+    """
     if value is None:
         return ""
     value = value.strip()
-    encoded = value.encode("utf-8")[:maxlen]
-    return encoded.decode("utf-8", errors="ignore")
+    if len(value) > maxlen:
+        raise ValueError(
+            "Name is too long (maximum %d characters). "
+            "Please shorten the name and try again." % maxlen
+        )
+    return value
 
 
 def hash_password(p):
@@ -304,7 +322,11 @@ def handle_submission():
     data = session.get("form_data", {})
     doc_path = session.get("doc_path", "")
 
-    name = sanitize(data.get("applicant_name", ""))
+    try:
+        name = sanitize(data.get("applicant_name", ""))
+    except ValueError as exc:
+        flash(str(exc))
+        return redirect(url_for("form_step", step=1))
     village = data.get("village", "").strip()
     block = data.get("block", "").strip()
     gender = data.get("gender", "")
@@ -415,11 +437,46 @@ def generate_acknowledgment(cur, app_id):
     display_row = row[:9] + (display_status,)
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, "GOVERNMENT OF PURVANCHAL", ln=1, align="C")
-    pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 8, "Department of Social Welfare", ln=1, align="C")
-    pdf.cell(0, 8, "Old Age Pension Scheme - Acknowledgment", ln=1, align="C")
+
+    # Fix 6 – embed Noto Sans Bengali so Assamese/Bengali names render correctly.
+    # The built-in Helvetica font is latin-1 only; any codepoint > 127 was
+    # silently replaced with '?' by the bare except branch below.
+    # We load the TTF once; if the file is somehow missing, fall back to
+    # Helvetica (PDF will still be generated, names may show '?').
+    noto_ok = False
+    if os.path.exists(NOTO_BENGALI_FONT):
+        try:
+            pdf.add_font(family="NotoSansBengali", fname=NOTO_BENGALI_FONT)
+            # Try enabling HarfBuzz text shaping (needs uharfbuzz installed).
+            # If uharfbuzz is absent or set_text_shaping() does not exist on
+            # this fpdf2 build, we skip shaping – the font still embeds
+            # correctly and Latin + common Bengali glyphs will render.
+            try:
+                pdf.set_text_shaping(use_shaping_engine=True)
+            except Exception:
+                pass  # shaping unavailable – font still embedded
+            noto_ok = True
+        except Exception:
+            pass  # font file corrupt or add_font failed
+
+    def _set_title_font(bold=False):
+        style = "B" if bold else ""
+        if noto_ok:
+            pdf.set_font("NotoSansBengali", style=style, size=14 if bold else 11)
+        else:
+            pdf.set_font("Helvetica", style=style, size=14 if bold else 11)
+
+    def _set_body_font(size=10):
+        if noto_ok:
+            pdf.set_font("NotoSansBengali", size=size)
+        else:
+            pdf.set_font("Helvetica", size=size)
+
+    _set_title_font(bold=True)
+    pdf.cell(0, 10, "GOVERNMENT OF PURVANCHAL", new_x="LMARGIN", new_y="NEXT", align="C")
+    _set_title_font(bold=False)
+    pdf.cell(0, 8, "Department of Social Welfare", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 8, "Old Age Pension Scheme - Acknowledgment", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(4)
     # decorative border, as per approved letterhead design
     for i in range(0, 2000):
@@ -428,15 +485,15 @@ def generate_acknowledgment(cur, app_id):
         pdf.line(x, 12, x + 0.5, 12)
     labels = ["Application No", "Applicant Name", "Mobile", "Date of Birth",
               "Village", "Block", "Bank Account", "IFSC", "Submitted At", "Status"]
-    pdf.set_font("Helvetica", "", 10)
+    _set_body_font(size=10)
     for label, val in zip(labels, display_row):
-        try:
-            pdf.cell(60, 8, label, border=1)
-            pdf.cell(0, 8, str(val), border=1, ln=1)
-        except Exception:
-            pdf.cell(0, 8, "?", border=1, ln=1)
+        pdf.cell(60, 8, label, border=1)
+        pdf.cell(0, 8, str(val), border=1, new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
-    pdf.set_font("Helvetica", "I", 9)
+    if noto_ok:
+        pdf.set_font("NotoSansBengali", size=9)
+    else:
+        pdf.set_font("Helvetica", style="I", size=9)
     pdf.multi_cell(0, 5, "This is a computer generated acknowledgment. Processing SLA "
                          "as per the Purvanchal Right to Public Services Act applies.")
     return bytes(pdf.output())
