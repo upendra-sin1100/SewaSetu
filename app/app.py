@@ -10,6 +10,7 @@ Maintenance contract ended 31/01/2026.
 import os
 import io
 import csv
+import uuid
 import random
 import hashlib
 import configparser
@@ -63,6 +64,22 @@ MIN_AGE = config.getint("pension", "min_age")
 SLA_DAYS = config.getint("pension", "sla_days")
 
 BLOCKS = ["Sonari", "Rajapara", "Dhemaji Pathar", "Borgaon", "Namti", "Khelua"]
+
+# Fix 5 – upload: honour the form's stated 5 MB / JPG+PDF promise.
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg"}
+
+# Safety net: if Flask's own MAX_CONTENT_LENGTH ever gets set, make sure it is
+# at least as large as our limit so we don't double-gate below our own cap.
+app.config.setdefault("MAX_CONTENT_LENGTH", MAX_UPLOAD_BYTES + 1024)
+
+
+@app.errorhandler(413)
+def request_entity_too_large(e):
+    """Replace Flask's default 413 page with a citizen-readable message."""
+    flash("This file is too large. "
+          "Please upload a JPG or PDF smaller than 5 MB.")
+    return render_template("upload.html"), 413
 
 import logging
 _logdir = "/var/log/sewasetu"
@@ -234,19 +251,36 @@ def upload():
         return redirect(url_for("apply"))
     if request.method == "POST":
         f = request.files.get("document")
+
+        # Fix 5a – no file chosen
         if f is None or f.filename == "":
-            flash("ERR_VAL_47")
+            flash("Please choose a file first. "
+                  "Tap \u2018Choose File\u2019, select your age proof, "
+                  "then tap \u2018Upload \u0026 Continue\u2019.")
             return render_template("upload.html")
-        filename = f.filename.lower()
-        content = f.read()
-        if not filename.endswith(".pdf"):
-            flash("ERR_VAL_47")
+
+        # Fix 5b – extension check (case-insensitive; .jpg, .jpeg, .pdf)
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            flash("This file type is not accepted. "
+                  "Please upload a JPG or PDF file.")
             return render_template("upload.html")
-        if len(content) > 102400:
-            flash("ERR_VAL_47")
+
+        # Fix 5c – size check: read up to limit+1 so we can detect over-limit
+        #           without loading the entire file into memory first.
+        content = f.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) == 0:
+            flash("This file is empty. Please choose a different file.")
             return render_template("upload.html")
+        if len(content) > MAX_UPLOAD_BYTES:
+            flash("This file is too large. "
+                  "Please upload a JPG or PDF smaller than 5 MB.")
+            return render_template("upload.html")
+
+        # Fix 5d – safe filename: use uuid + extension; never the user's name.
+        safe_name = "%s_%s%s" % (session["verified_mobile"], uuid.uuid4().hex, ext)
         os.makedirs(UPLOAD_DIR, exist_ok=True)
-        path = os.path.join(UPLOAD_DIR, "%s_%s" % (session["verified_mobile"], filename))
+        path = os.path.join(UPLOAD_DIR, safe_name)
         with open(path, "wb") as out:
             out.write(content)
         session["doc_path"] = path

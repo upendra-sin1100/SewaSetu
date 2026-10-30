@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Fix 5 – Upload: accept JPG/PDF up to 5 MB, plain-language errors.
 
@@ -74,20 +74,31 @@ def _upload_client(mod, extra_sess=None):
     return flask_app.test_client()
 
 
-def _post_upload(client, mod, filename, content, content_type="application/pdf"):
-    """POST multipart/form-data to /upload."""
+def _post_upload(client, mod, filename, content, content_type="application/pdf",
+                 mock_write=True):
+    """
+    POST multipart/form-data to /upload.
+
+    mock_write=True  (success paths): mock os.makedirs and builtins.open so no
+                     disk I/O happens; the route reaches open() only on the happy path.
+    mock_write=False (error paths):   do NOT mock builtins.open because render_template
+                     calls open() internally to load templates; mocking it would return
+                     an empty response body, defeating the message-content assertions.
+    """
     data = {}
     if filename is not None:
         data["document"] = (io.BytesIO(content), filename, content_type)
-    with mock.patch.object(mod, "UPLOAD_DIR", "/fake/uploads"), \
-         mock.patch("os.makedirs"), \
-         mock.patch("builtins.open", mock.mock_open()):
-        resp = client.post(
-            "/upload",
-            data=data,
-            content_type="multipart/form-data",
-        )
-    return resp
+
+    if mock_write:
+        with mock.patch.object(mod, "UPLOAD_DIR", "/fake/uploads"), \
+             mock.patch("os.makedirs"), \
+             mock.patch("builtins.open", mock.mock_open()):
+            return client.post("/upload", data=data, content_type="multipart/form-data")
+    else:
+        # Error paths return before ever calling open(); no mock needed.
+        with mock.patch.object(mod, "UPLOAD_DIR", "/fake/uploads"), \
+             mock.patch("os.makedirs"):
+            return client.post("/upload", data=data, content_type="multipart/form-data")
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +117,9 @@ class TestUpload:
             self._mod = mod
             yield
 
-    def _post(self, filename, content, ct="application/pdf"):
-        return _post_upload(self._c, self._mod, filename, content, ct)
+    def _post(self, filename, content, ct="application/pdf", mock_write=True):
+        return _post_upload(self._c, self._mod, filename, content, ct,
+                            mock_write=mock_write)
 
     # T-UPL-1: small PDF -> 302
     def test_small_pdf_accepted(self):
@@ -141,41 +153,43 @@ class TestUpload:
     def test_oversized_file_gives_plain_error(self):
         """T-UPL-4: >5 MB file shows a message mentioning '5 MB', not 'ERR_VAL_'."""
         oversized = b"%PDF-1.4 " + b"B" * (5 * 1024 * 1024 + 1)
-        resp = self._post("huge.pdf", oversized)
+        # Error path: no file is written; do not mock builtins.open.
+        resp = self._post("huge.pdf", oversized, mock_write=False)
         body = resp.get_data(as_text=True)
         assert "ERR_VAL_" not in body, (
             "Oversized file still shows 'ERR_VAL_'. Replace with a plain message."
         )
         assert "5 MB" in body or "5mb" in body.lower(), (
-            f"Oversized file message does not mention '5 MB'. Got: {body[:300]}"
+            f"Oversized file message does not mention '5 MB'. Got: {body[:400]}"
         )
 
     # T-UPL-5: wrong extension -> plain error mentioning allowed types
     def test_wrong_extension_gives_plain_error(self):
         """T-UPL-5: A .txt file shows a message mentioning 'JPG or PDF', not 'ERR_VAL_'."""
-        resp = self._post("notes.txt", b"hello world", "text/plain")
+        # Error path: no file is written; do not mock builtins.open.
+        resp = self._post("notes.txt", b"hello world", "text/plain", mock_write=False)
         body = resp.get_data(as_text=True)
         assert "ERR_VAL_" not in body, (
             "Wrong-extension error still shows 'ERR_VAL_'. Replace with a plain message."
         )
         assert "JPG" in body or "PDF" in body, (
-            f"Wrong-extension message does not mention 'JPG or PDF'. Got: {body[:300]}"
+            f"Wrong-extension message does not mention 'JPG or PDF'. Got: {body[:400]}"
         )
 
     # T-UPL-6: no file -> plain error mentioning "choose"
     def test_no_file_gives_plain_error(self):
         """T-UPL-6: Submitting with no file chosen shows a helpful message."""
-        # POST with empty data dict (no 'document' field at all)
+        # POST with empty data dict (no 'document' field at all).
+        # Error path: route returns before open(); do not mock builtins.open.
         with mock.patch.object(self._mod, "UPLOAD_DIR", "/fake/uploads"), \
-             mock.patch("os.makedirs"), \
-             mock.patch("builtins.open", mock.mock_open()):
+             mock.patch("os.makedirs"):
             resp = self._c.post("/upload", data={}, content_type="multipart/form-data")
         body = resp.get_data(as_text=True)
         assert "ERR_VAL_" not in body, (
             "No-file error still shows 'ERR_VAL_'. Replace with a plain message."
         )
         assert "choose" in body.lower() or "select" in body.lower(), (
-            f"No-file message does not say 'choose' or 'select'. Got: {body[:300]}"
+            f"No-file message does not say 'choose' or 'select'. Got: {body[:400]}"
         )
 
     # T-UPL-7: path traversal in filename -> uuid-based safe path
