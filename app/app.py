@@ -447,6 +447,11 @@ def generate_acknowledgment(cur, app_id):
     if os.path.exists(NOTO_BENGALI_FONT):
         try:
             pdf.add_font(family="NotoSansBengali", fname=NOTO_BENGALI_FONT)
+            # Register the same Regular TTF for the Bold style slot so that
+            # set_font("NotoSansBengali", style="B") resolves.  We only have
+            # one weight; the title is visually distinguished by size alone.
+            pdf.add_font(family="NotoSansBengali", style="B",
+                         fname=NOTO_BENGALI_FONT)
             # Try enabling HarfBuzz text shaping (needs uharfbuzz installed).
             # If uharfbuzz is absent or set_text_shaping() does not exist on
             # this fpdf2 build, we skip shaping – the font still embeds
@@ -458,6 +463,7 @@ def generate_acknowledgment(cur, app_id):
             noto_ok = True
         except Exception:
             pass  # font file corrupt or add_font failed
+
 
     def _set_title_font(bold=False):
         style = "B" if bold else ""
