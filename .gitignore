@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# Local-only data files (pg_dump outputs, DC review lists)
+*.dump
+*.sql.gz
+under60_dc_review.txt
