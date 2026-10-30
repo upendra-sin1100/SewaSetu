@@ -2,27 +2,15 @@
 """
 Task 3 – Post-submission acknowledgement download (no citizen login).
 
-After a NEW application is submitted the confirmation page shows a
-"Download Acknowledgment (PDF)" link.  The applicant has NOT gone through
-the status-portal login, so session["logged_in"] is not set.
-
-This must work WITHOUT requiring the citizen to log in separately, because:
-  - The citizen just proved identity via mobile OTP during the apply flow.
-  - Forcing a second login immediately after submission is hostile UX and
-    will cause support calls / tout exploitation.
-
-Fix approach: handle_submission() sets session["just_submitted_id"] = new_id.
-              ack_pdf() checks this flag as a one-time authorization; the flag
-              is cleared (popped) after it is used.
-
 RED tests (fail before fix, pass after):
-  T-ACK-1  ack_pdf must allow access when session["just_submitted_id"] matches
-  T-ACK-2  ack_pdf must reject a mismatched just_submitted_id (wrong id)
+  T-ACK-1  ack_pdf allows access when session["just_submitted_id"] matches
+  T-ACK-2  ack_pdf rejects mismatched just_submitted_id (wrong id)
   T-ACK-3  just_submitted_id is one-time: second fetch returns 302/403
-  T-ACK-4  handle_submission sets just_submitted_id in session
+  T-ACK-4  handle_submission sets just_submitted_id in session (source check)
 """
 
 import importlib.util
+import io
 import os
 import types
 import unittest.mock as mock
@@ -80,14 +68,12 @@ class TestAckPdfWithSubmitToken:
         fake_pdf = b"%PDF-1.4 fake"
 
         with mock.patch.object(mod, "get_db", return_value=fake_conn), \
-             mock.patch("os.path.exists", return_value=True), \
-             mock.patch("flask.send_file",
-                        return_value=flask_app.response_class(
-                            response=fake_pdf, status=200,
-                            mimetype="application/pdf")):
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch.object(mod, "generate_acknowledgment",
+                               return_value=fake_pdf):
             with flask_app.test_client() as c:
                 with c.session_transaction() as sess:
-                    # NOT logged_in, NOT admin – only just_submitted_id
+                    # NOT logged_in, NOT admin - only just_submitted_id
                     sess["just_submitted_id"] = NEW_APP_ID
                 resp = c.get(f"/ack/{NEW_APP_ID}.pdf")
 
@@ -119,11 +105,9 @@ class TestAckPdfWithSubmitToken:
         fake_pdf = b"%PDF-1.4 fake"
 
         with mock.patch.object(mod, "get_db", return_value=fake_conn), \
-             mock.patch("os.path.exists", return_value=True), \
-             mock.patch("flask.send_file",
-                        return_value=flask_app.response_class(
-                            response=fake_pdf, status=200,
-                            mimetype="application/pdf")):
+             mock.patch("os.path.exists", return_value=False), \
+             mock.patch.object(mod, "generate_acknowledgment",
+                               return_value=fake_pdf):
             with flask_app.test_client() as c:
                 with c.session_transaction() as sess:
                     sess["just_submitted_id"] = NEW_APP_ID
@@ -145,6 +129,5 @@ class TestAckPdfWithSubmitToken:
             "handle_submission() does not set session['just_submitted_id']. "
             "Citizens who just submitted cannot download their acknowledgement "
             "PDF without a separate login. "
-            "Fix: add  session['just_submitted_id'] = new_id  in handle_submission() "
-            "BEFORE clearing other session keys."
+            "Fix: add  session['just_submitted_id'] = new_id  in handle_submission()."
         )

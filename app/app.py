@@ -351,6 +351,11 @@ def handle_submission():
         out.write(pdf_bytes)
 
     cur.close(); conn.close()
+    # Fix 4 – post-submission ack download: set a one-time session token so
+    # the citizen can fetch their own PDF immediately after submitting, without
+    # a separate status-portal login.  The token is popped by ack_pdf() on
+    # first use and cannot be used for any other application id.
+    session["just_submitted_id"] = new_id
     session.pop("form_data", None)
     session.pop("doc_path", None)
     session.pop("verified_mobile", None)
@@ -467,29 +472,41 @@ def view_application(app_id):
 @app.route("/ack/<int:app_id>.pdf")
 def ack_pdf(app_id):
     # Fix 2 – IDOR: require citizen login and ownership check.
-    if not session.get("logged_in"):
+    # Fix 4 – post-submission: honour one-time just_submitted_id token so a
+    # citizen can download their PDF immediately after submitting without a
+    # separate status-portal login.  The token is popped (one-time use only)
+    # and must match the requested app_id exactly.
+    just_submitted = session.pop("just_submitted_id", None)
+    if just_submitted == app_id:
+        # One-time authorised: citizen just submitted this exact application.
+        # Fall through to serve the PDF; no further ownership check needed.
+        pass
+    elif not session.get("logged_in"):
         flash("Please login to view your acknowledgement PDF.")
         return redirect(url_for("status_login"))
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT mobile FROM applications WHERE id = %s",
-        (app_id,),
-    )
-    row = cur.fetchone()
-    if not row:
+    else:
+        # Logged-in path: check ownership.
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT mobile FROM applications WHERE id = %s",
+            (app_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close(); conn.close()
+            abort(404)
+        if not session.get("admin") and row[0] != session.get("portal_mobile"):
+            cur.close(); conn.close()
+            abort(403)
         cur.close(); conn.close()
-        abort(404)
-    # Admins may view any PDF; citizens may only view their own.
-    if not session.get("admin") and row[0] != session.get("portal_mobile"):
-        cur.close(); conn.close()
-        abort(403)
     path = os.path.join(UPLOAD_DIR, "ack", "%d.pdf" % app_id)
     if not os.path.exists(path):
-        data = generate_acknowledgment(cur, app_id)
-        cur.close(); conn.close()
+        conn2 = get_db()
+        cur2  = conn2.cursor()
+        data  = generate_acknowledgment(cur2, app_id)
+        cur2.close(); conn2.close()
         return send_file(io.BytesIO(data), mimetype="application/pdf")
-    cur.close(); conn.close()
     return send_file(path, mimetype="application/pdf")
 
 
